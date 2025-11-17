@@ -1,0 +1,45 @@
+{
+  "name": "studio-8-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A comprehensive, full-stack web system for managing Studio 8, a photo studio.",
+  "type": "module",
+  "scripts": {
+     "dev": "vite",
+    "build": "tsc && vite build && mkdir -p dist/lib && cp -r lib/* dist/lib/ || true",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@google/genai": "^0.11.0",
+    "cloudinary": "^2.8.0",
+    "date-fns": "^2.30.0",
+    "firebase": "^12.5.0",
+    "firebase-admin": "^12.1.0",
+    "framer-motion": "^11.2.4",
+    "html2canvas": "^1.4.1",
+    "jspdf": "^2.5.1",
+    "lucide-react": "^0.378.0",
+    "pdfkit": "^0.17.2",
+    "qrcode": "^1.5.4",
+    "react": "^18.2.0",
+    "react-big-calendar": "^1.12.2",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.23.0",
+    "recharts": "^2.12.7",
+    "web-push": "^3.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@types/pdfkit": "^0.13.4",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "^18.2.0",
+    "@types/react-big-calendar": "^1.8.9",
+    "@types/react-dom": "^18.2.0",
+    "@types/web-push": "^3.6.3",
+    "@vercel/node": "^3.1.7",
+    "tailwindcss": "^3.4.3",
+    "typescript": "^5.4.5",
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.3.1"
+  }
+}

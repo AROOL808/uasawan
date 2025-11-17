@@ -1,0 +1,19 @@
+// tsconfig.node.json (INI SUDAH BENAR)
+{
+  "compilerOptions": {
+    "composite": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    "types": ["node"]
+  },
+  "include": [
+    "vite.config.ts",
+    "api/**/*.ts",
+    "scripts/**/*.ts",
+    "lib/**/*.ts",
+    "types.ts"
+  ]
+}
