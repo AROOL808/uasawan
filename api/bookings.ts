@@ -1,3 +1,4 @@
+
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import admin from 'firebase-admin';
 import { v2 as cloudinary } from 'cloudinary';
@@ -210,193 +211,143 @@ async function handleCompleteSession(req: VercelRequest, res: VercelResponse) {
 
 
 async function handleCreatePublic(req: VercelRequest, res: VercelResponse) {
-	const db = admin.firestore();
-	const formData = req.body;
+    const db = admin.firestore();
+    const formData = req.body;
+    const newBookingCode = `S8-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+    
+    let paymentProofUrl = '';
+    let paymentProofPublicId = '';
 
-	if (!formData || !formData.email || !formData.packageId || !formData.subPackageId || !formData.date || !formData.time) {
-		return res.status(400).json({ success: false, message: 'Missing required booking fields.' });
-	}
+    if (formData.paymentProofBase64) {
+        const { base64, mimeType } = formData.paymentProofBase64;
+        const dataUrl = `data:${mimeType};base64,${base64}`;
+        const publicId = `proof_${newBookingCode}`;
+        try {
+            const uploadResult = await cloudinary.uploader.upload(dataUrl, {
+                folder: "studio8_uploads", public_id: publicId, resource_type: "auto", upload_preset: process.env.CLOUDINARY_UPLOAD_PRESET,
+            });
+            if (!uploadResult?.secure_url) throw new Error("Cloudinary gagal memberikan URL yang aman setelah upload.");
+            paymentProofUrl = uploadResult.secure_url;
+            paymentProofPublicId = uploadResult.public_id;
+        } catch (uploadError: any) {
+            const message = uploadError.error?.message || uploadError.message || 'Gagal mengunggah bukti pembayaran.';
+            throw new Error(message);
+        }
+    }
+    
+    try {
+        const bookingRef = db.collection('bookings').doc();
+        const lowerEmail = formData.email.toLowerCase();
+        const clientRef = db.collection('clients').doc(lowerEmail);
 
-	// Generate a provisional booking code for client to reference when calling paymentHandle
-	const newBookingCode = `S8-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+        await db.runTransaction(async (transaction) => {
+            const packagesSnap = await transaction.get(db.collection('packages'));
+            const addOnsSnap = await transaction.get(db.collection('addons'));
+            const settingsDoc = await transaction.get(db.collection('settings').doc('main'));
+            const promosSnap = await transaction.get(db.collection('promos'));
+            const clientDoc = await transaction.get(clientRef);
+            
+            if (!settingsDoc.exists) throw new Error("Pengaturan sistem tidak ditemukan. Hubungi admin.");
+            
+            const allPackages = packagesSnap.docs.map(doc => fromFirestore<Package>(doc));
+            const allAddOns = addOnsSnap.docs.map(doc => fromFirestore<AddOn>(doc));
+            const allPromos = promosSnap.docs.map(doc => fromFirestore<Promo>(doc));
+            const settings = settingsDoc.data() as SystemSettings;
+            let client = clientDoc.exists ? fromFirestore<Client>(clientDoc) : null;
+            
+            const isNewClient = !client;
+            if (isNewClient) {
+                client = {
+                    id: lowerEmail, name: formData.name, email: lowerEmail, phone: formData.whatsapp,
+                    firstBooking: admin.firestore.Timestamp.now(), lastBooking: admin.firestore.Timestamp.now(),
+                    totalBookings: 0, totalSpent: 0, loyaltyPoints: 0, referralCode: `S8REF-${Math.random().toString(36).substring(2, 8).toUpperCase()}`, loyaltyTier: 'Newbie'
+                };
+            }
 
-	// Build a minimal booking draft to return to client. Do NOT upload or write anything to Firestore here.
-	const bookingDraft = {
-		bookingCode: newBookingCode,
-		clientName: formData.name,
-		clientEmail: formData.email,
-		clientPhone: formData.whatsapp,
-		bookingDateISO: new Date(`${formData.date}T${formData.time}`).toISOString(),
-		numberOfPeople: formData.people || 1,
-		packageId: formData.packageId,
-		subPackageId: formData.subPackageId,
-		subAddOnIds: formData.subAddOnIds || [],
-		promoCode: formData.promoCode || null,
-		referralCode: formData.referralCode || null,
-		usePoints: !!formData.usePoints,
-		paymentMethod: formData.paymentMethod || 'unknown',
-		notes: formData.notes || '',
-		// NOTE: paymentProofBase64 MUST NOT be processed here. It will be processed in 'paymentHandle'.
-	};
+            if (!client) throw new Error('Data klien tidak dapat dibuat atau ditemukan.');
+            
+            const selectedPackage = allPackages.find(p => p.id === formData.packageId);
+            if (!selectedPackage) throw new Error("Paket yang Anda pilih tidak lagi tersedia.");
+            const selectedSubPackage = selectedPackage.subPackages.find(sp => sp.id === formData.subPackageId);
+            if (!selectedSubPackage) throw new Error("Varian paket yang Anda pilih tidak lagi tersedia.");
+            const selectedSubAddOns = allAddOns.flatMap(a => a.subAddOns).filter(sa => formData.subAddOnIds.includes(sa.id));
+            
+            let extraPersonCharge = (selectedPackage.isGroupPackage && formData.people > 2) ? (formData.people - 2) * 15000 : 0;
+            let subtotal = selectedSubPackage.price + selectedSubAddOns.reduce((sum, sa) => sum + sa.price, 0) + extraPersonCharge;
+            
+            let discountAmount = 0, discountReason = '', pointsRedeemed = 0, pointsValue = 0, referralCodeUsed = '', promoCodeUsed = '';
 
-	return res.status(200).json({
-		success: true,
-		message: 'Booking draft created. Call action "paymentHandle" with this draft and paymentProof (if any) to finalize the booking.',
-		bookingDraft
-	});
-}
+            if (formData.promoCode && formData.promoCode.trim()) {
+                const promo = allPromos.find(p => p.code.toUpperCase() === formData.promoCode.toUpperCase() && p.isActive);
+                if (promo) {
+                    promoCodeUsed = promo.code; discountReason = promo.description;
+                    discountAmount = subtotal * (promo.discountPercentage / 100);
+                }
+            }
+            
+            if (!promoCodeUsed) {
+                if (isNewClient && formData.referralCode) {
+                     const referrerSnap = await transaction.get(db.collection('clients').where('referralCode', '==', formData.referralCode.toUpperCase()).limit(1));
+                     if (!referrerSnap.empty && referrerSnap.docs[0].id !== lowerEmail) {
+                        discountAmount = settings.loyaltySettings.firstBookingReferralDiscount;
+                        discountReason = `Diskon Referral`; referralCodeUsed = formData.referralCode.toUpperCase(); client.referredBy = referralCodeUsed;
+                     }
+                } else if (!isNewClient) {
+                    const sortedTiers = [...settings.loyaltySettings.loyaltyTiers].sort((a,b) => b.bookingThreshold - a.bookingThreshold);
+                    const clientTier = sortedTiers.find(t => client!.totalBookings >= t.bookingThreshold);
+                    if (clientTier) { discountAmount = subtotal * (clientTier.discountPercentage / 100); discountReason = `Diskon Tier ${clientTier.name} (${clientTier.discountPercentage}%)`; }
+                }
+            }
 
-// ============================================================
-// New: paymentHandle - uploads payment proof (if provided) and persists booking + client atomically.
-// ============================================================
-async function handlePayment(req: VercelRequest, res: VercelResponse) {
-	const db = admin.firestore();
-	const formData = req.body; // expects same payload as previous createPublic plus bookingCode
-	if (!formData || !formData.bookingCode || !formData.email || !formData.packageId || !formData.subPackageId || !formData.date || !formData.time) {
-		return res.status(400).json({ success: false, message: 'Missing required payment finalization fields.' });
-	}
+            if (formData.usePoints && client.loyaltyPoints > 0) {
+                pointsValue = Math.min(subtotal - discountAmount, client.loyaltyPoints * settings.loyaltySettings.rupiahPerPoint);
+                pointsRedeemed = Math.round(pointsValue / settings.loyaltySettings.rupiahPerPoint);
+                client.loyaltyPoints -= pointsRedeemed;
+            }
+            
+            let totalPrice = subtotal - discountAmount - pointsValue;
 
-	// Only initialize Cloudinary when we actually may upload files
-	try {
-		initializeCloudinary();
-	} catch (err: any) {
-		// If env not set and no file to upload, continue. But if there's a file and no config, fail.
-		if (formData.paymentProofBase64) {
-			return res.status(500).json({ success: false, message: 'Server not configured for uploads.' });
-		}
-	}
+            const newBookingData = {
+                bookingCode: newBookingCode, clientName: formData.name, clientEmail: formData.email, clientPhone: formData.whatsapp,
+                bookingDate: admin.firestore.Timestamp.fromDate(new Date(`${formData.date}T${formData.time}`)),
+                package: selectedPackage, selectedSubPackage,
+                addOns: allAddOns.filter(a => a.subAddOns.some(sa => formData.subAddOnIds.includes(sa.id))),
+                selectedSubAddOns, numberOfPeople: formData.people, paymentMethod: formData.paymentMethod,
+                paymentStatus: PaymentStatus.Pending, bookingStatus: BookingStatus.Pending,
+                totalPrice: totalPrice, remainingBalance: totalPrice, createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                paymentProofUrl, notes: formData.notes, discountAmount: discountAmount + pointsValue, 
+                discountReason, referralCodeUsed, promoCodeUsed, pointsRedeemed, pointsValue, extraPersonCharge
+            };
 
-	let paymentProofUrl = '';
-	let paymentProofPublicId = '';
+            transaction.set(bookingRef, newBookingData);
+            transaction.set(clientRef, client, { merge: true });
+        });
 
-	// Upload payment proof only here (if provided)
-	if (formData.paymentProofBase64) {
-		const { base64, mimeType } = formData.paymentProofBase64;
-		const dataUrl = `data:${mimeType};base64,${base64}`;
-		const publicId = `proof_${formData.bookingCode || `S8-${Math.random().toString(36).substring(2, 8).toUpperCase()}`}`;
-		try {
-			const uploadResult = await cloudinary.uploader.upload(dataUrl, {
-				folder: "studio8_uploads", public_id: publicId, resource_type: "auto", upload_preset: process.env.CLOUDINARY_UPLOAD_PRESET,
-			});
-			if (!uploadResult?.secure_url) throw new Error("Cloudinary did not return a secure URL.");
-			paymentProofUrl = uploadResult.secure_url;
-			paymentProofPublicId = uploadResult.public_id;
-		} catch (uploadError: any) {
-			const message = uploadError.error?.message || uploadError.message || 'Failed to upload payment proof.';
-			return res.status(500).json({ success: false, message });
-		}
-	}
+        const bookingDate = new Date(`${formData.date}T${formData.time}`);
+        const body = `Sesi untuk ${formData.name} pada ${bookingDate.toLocaleDateString('id-ID', {day: '2-digit', month: 'long'})}`;
+        sendPushNotification(db, 'Booking Baru Diterima!', body, '/admin/schedule').catch(err => {
+            console.error("Failed to send push notification in background:", err);
+        });
 
-	// Now run the DB transaction to persist the booking and client atomically
-	try {
-		const bookingRef = db.collection('bookings').doc();
-		const lowerEmail = formData.email.toLowerCase();
-		const clientRef = db.collection('clients').doc(lowerEmail);
+        return res.status(200).json({ 
+            success: true, message: "Booking berhasil dibuat!",
+            bookingCode: newBookingCode, cloudinaryUrl: paymentProofUrl 
+        });
 
-		await db.runTransaction(async (transaction) => {
-			const packagesSnap = await transaction.get(db.collection('packages'));
-			const addOnsSnap = await transaction.get(db.collection('addons'));
-			const settingsDoc = await transaction.get(db.collection('settings').doc('main'));
-			const promosSnap = await transaction.get(db.collection('promos'));
-			const clientDoc = await transaction.get(clientRef);
-
-			if (!settingsDoc.exists) throw new Error("System settings not found.");
-
-			const allPackages = packagesSnap.docs.map(doc => fromFirestore<Package>(doc));
-			const allAddOns = addOnsSnap.docs.map(doc => fromFirestore<AddOn>(doc));
-			const allPromos = promosSnap.docs.map(doc => fromFirestore<Promo>(doc));
-			const settings = settingsDoc.data() as SystemSettings;
-			let client = clientDoc.exists ? fromFirestore<Client>(clientDoc) : null;
-
-			const isNewClient = !client;
-			if (isNewClient) {
-				client = {
-					id: lowerEmail, name: formData.name, email: lowerEmail, phone: formData.whatsapp,
-					firstBooking: admin.firestore.Timestamp.now(), lastBooking: admin.firestore.Timestamp.now(),
-					totalBookings: 0, totalSpent: 0, loyaltyPoints: 0, referralCode: `S8REF-${Math.random().toString(36).substring(2, 8).toUpperCase()}`, loyaltyTier: 'Newbie'
-				};
-			}
-
-			if (!client) throw new Error('Client data could not be constructed.');
-
-			const selectedPackage = allPackages.find(p => p.id === formData.packageId);
-			if (!selectedPackage) throw new Error("Selected package not available.");
-			const selectedSubPackage = selectedPackage.subPackages.find(sp => sp.id === formData.subPackageId);
-			if (!selectedSubPackage) throw new Error("Selected sub-package not available.");
-			const selectedSubAddOns = allAddOns.flatMap(a => a.subAddOns).filter(sa => (formData.subAddOnIds || []).includes(sa.id));
-
-			let extraPersonCharge = (selectedPackage.isGroupPackage && formData.people > 2) ? (formData.people - 2) * 15000 : 0;
-			let subtotal = selectedSubPackage.price + selectedSubAddOns.reduce((sum, sa) => sum + sa.price, 0) + extraPersonCharge;
-
-			let discountAmount = 0, discountReason = '', pointsRedeemed = 0, pointsValue = 0, referralCodeUsed = '', promoCodeUsed = '';
-
-			if (formData.promoCode && formData.promoCode.trim()) {
-				const promo = allPromos.find(p => p.code.toUpperCase() === formData.promoCode.toUpperCase() && p.isActive);
-				if (promo) {
-					promoCodeUsed = promo.code; discountReason = promo.description;
-					discountAmount = subtotal * (promo.discountPercentage / 100);
-				}
-			}
-
-			if (!promoCodeUsed) {
-				if (isNewClient && formData.referralCode) {
-					const referrerSnap = await transaction.get(db.collection('clients').where('referralCode', '==', formData.referralCode.toUpperCase()).limit(1));
-					if (!referrerSnap.empty && referrerSnap.docs[0].id !== lowerEmail) {
-						discountAmount = settings.loyaltySettings.firstBookingReferralDiscount;
-						discountReason = `Referral Discount`; referralCodeUsed = formData.referralCode.toUpperCase(); client.referredBy = referralCodeUsed;
-					}
-				} else if (!isNewClient) {
-					const sortedTiers = [...settings.loyaltySettings.loyaltyTiers].sort((a,b) => b.bookingThreshold - a.bookingThreshold);
-					const clientTier = sortedTiers.find(t => client!.totalBookings >= t.bookingThreshold);
-					if (clientTier) { discountAmount = subtotal * (clientTier.discountPercentage / 100); discountReason = `Tier ${clientTier.name} Discount (${clientTier.discountPercentage}%)`; }
-				}
-			}
-
-			if (formData.usePoints && client.loyaltyPoints > 0) {
-				pointsValue = Math.min(subtotal - discountAmount, client.loyaltyPoints * settings.loyaltySettings.rupiahPerPoint);
-				pointsRedeemed = Math.round(pointsValue / settings.loyaltySettings.rupiahPerPoint);
-				client.loyaltyPoints -= pointsRedeemed;
-			}
-
-			let totalPrice = subtotal - discountAmount - pointsValue;
-
-			const newBookingData = {
-				bookingCode: formData.bookingCode, clientName: formData.name, clientEmail: formData.email, clientPhone: formData.whatsapp,
-				bookingDate: admin.firestore.Timestamp.fromDate(new Date(`${formData.date}T${formData.time}`)),
-				package: selectedPackage, selectedSubPackage,
-				addOns: allAddOns.filter(a => a.subAddOns.some(sa => (formData.subAddOnIds || []).includes(sa.id))),
-				selectedSubAddOns, numberOfPeople: formData.people, paymentMethod: formData.paymentMethod,
-				paymentStatus: PaymentStatus.Pending, bookingStatus: BookingStatus.Pending,
-				totalPrice: totalPrice, remainingBalance: totalPrice, createdAt: admin.firestore.FieldValue.serverTimestamp(),
-				paymentProofUrl, notes: formData.notes, discountAmount: discountAmount + pointsValue,
-				discountReason, referralCodeUsed, promoCodeUsed, pointsRedeemed, pointsValue, extraPersonCharge
-			};
-
-			transaction.set(bookingRef, newBookingData);
-			transaction.set(clientRef, client, { merge: true });
-		});
-
-		// After successful transaction, send push notification
-		const bookingDate = new Date(`${formData.date}T${formData.time}`);
-		const body = `Sesi untuk ${formData.name} pada ${bookingDate.toLocaleDateString('id-ID', {day: '2-digit', month: 'long'})}`;
-		sendPushNotification(db, 'Booking Baru Diterima!', body, '/admin/schedule').catch(err => {
-			console.error("Failed to send push notification in background:", err);
-		});
-
-		return res.status(200).json({
-			success: true,
-			message: 'Booking finalized and saved.',
-			bookingCode: formData.bookingCode
-		});
-	} catch (transactionError: any) {
-		// If transaction failed, delete uploaded Cloudinary file (if any)
-		if (paymentProofPublicId) {
-			console.warn(`Transaction failed. Deleting orphaned Cloudinary file: ${paymentProofPublicId}`);
-			await cloudinary.uploader.destroy(paymentProofPublicId).catch(delErr => console.error(`CRITICAL: Failed to delete orphaned file ${paymentProofPublicId}`, delErr));
-		}
-		console.error("Payment handle transaction failed:", transactionError);
-		return res.status(500).json({ success: false, message: `Failed to finalize booking: ${transactionError.message}` });
-	}
+    } catch (transactionError: any) {
+        // Jika transaksi database gagal, hapus file yang sudah diupload.
+        if (paymentProofPublicId) {
+            console.warn(`Firestore transaction failed. Deleting orphaned Cloudinary file: ${paymentProofPublicId}`);
+            try {
+                await cloudinary.uploader.destroy(paymentProofPublicId);
+                console.log(`Successfully deleted orphaned file: ${paymentProofPublicId}`);
+            } catch (deleteError) {
+                console.error(`CRITICAL: Failed to delete orphaned Cloudinary file ${paymentProofPublicId}. Manual cleanup required.`, deleteError);
+            }
+        }
+        // Lempar error agar ditangkap oleh handler utama.
+        throw new Error(`Transaksi database gagal: ${transactionError.message}`);
+    }
 }
 
 async function handleCreatePublicInstitutional(req: VercelRequest, res: VercelResponse) {
@@ -458,14 +409,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     try {
         initFirebaseAdmin();
-        // DO NOT initialize Cloudinary globally here - only handlers that perform uploads will call initializeCloudinary themselves.
+        initializeCloudinary();
         req.body = payload; // Re-assign body for individual handlers to use
 
         switch (action) {
             case 'createPublic':
                 return await handleCreatePublic(req, res);
-            case 'paymentHandle':
-                return await handlePayment(req, res);
             case 'createPublicInstitutional':
                 return await handleCreatePublicInstitutional(req, res);
             case 'complete':
